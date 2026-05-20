@@ -1,7 +1,12 @@
-use std::{ffi::CStr, os::raw::c_int};
+// Patch: ggml renamed the Vulkan-specific backend functions to generic device
+// API in whisper.cpp >=1.7.4 / ggml >=0.10. The old ggml_backend_vk_* symbols
+// no longer exist; we enumerate all registered devices and filter to GPU/IGPU.
+use std::ffi::CStr;
 use whisper_rs_sys::{
-    ggml_backend_buffer_type_t, ggml_backend_vk_buffer_type, ggml_backend_vk_get_device_count,
-    ggml_backend_vk_get_device_description, ggml_backend_vk_get_device_memory,
+    ggml_backend_buffer_type_t, ggml_backend_dev_buffer_type, ggml_backend_dev_count,
+    ggml_backend_dev_description, ggml_backend_dev_get, ggml_backend_dev_memory,
+    ggml_backend_dev_type, ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU,
+    ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU,
 };
 
 #[derive(Debug, Clone)]
@@ -19,29 +24,50 @@ pub struct VkDeviceInfo {
     /// Buffer type to pass to `whisper::Backend::create_buffer`
     pub buf_type: ggml_backend_buffer_type_t,
 }
+
 /// Enumerate every physical GPU ggml can see.
 ///
+/// Filters the global device registry to GPU and IGPU entries, which on Linux
+/// with Vulkan enabled correspond to Vulkan-backed devices.
+///
 /// Note: integrated GPUs are returned *after* discrete ones,
-/// mirroring ggml’s C logic.
+/// mirroring ggml's C logic.
 pub fn list_devices() -> Vec<VkDeviceInfo> {
     unsafe {
-        let n = ggml_backend_vk_get_device_count();
-        (0..n)
-            .map(|id| {
-                // 256 bytes is plenty (spec says 128 is enough)
-                let mut tmp: [libc::c_char; 256] = [0; 256];
-                ggml_backend_vk_get_device_description(id as c_int, tmp.as_mut_ptr(), tmp.len());
-                let mut free = 0usize;
-                let mut total = 0usize;
-                ggml_backend_vk_get_device_memory(id, &mut free, &mut total);
-                VkDeviceInfo {
-                    id,
-                    name: CStr::from_ptr(tmp.as_ptr()).to_string_lossy().into_owned(),
-                    vram: VKVram { free, total },
-                    buf_type: ggml_backend_vk_buffer_type(id as usize),
-                }
-            })
-            .collect()
+        let n = ggml_backend_dev_count();
+        let mut devices = Vec::new();
+        let mut vk_id: i32 = 0;
+
+        for i in 0..n {
+            let dev = ggml_backend_dev_get(i);
+            let dev_type = ggml_backend_dev_type(dev);
+            if dev_type != ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                && dev_type != ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+            {
+                continue;
+            }
+
+            let desc_ptr = ggml_backend_dev_description(dev);
+            let name = if desc_ptr.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(desc_ptr).to_string_lossy().into_owned()
+            };
+
+            let mut free = 0usize;
+            let mut total_mem = 0usize;
+            ggml_backend_dev_memory(dev, &mut free, &mut total_mem);
+
+            devices.push(VkDeviceInfo {
+                id: vk_id,
+                name,
+                vram: VKVram { free, total: total_mem },
+                buf_type: ggml_backend_dev_buffer_type(dev),
+            });
+            vk_id += 1;
+        }
+
+        devices
     }
 }
 
